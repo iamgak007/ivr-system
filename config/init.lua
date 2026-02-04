@@ -39,10 +39,10 @@ local configs = {}
 -- Configuration file definitions
 -- Maps logical configuration names to their file paths
 local config_files = {
-    ivr = "ivrconfig (3).json",                    -- IVR flow and node definitions
-    webapi = "automax_webAPIConfig (2).json",      -- API endpoint configurations
-    extensions = "Extensions_qa.json",              -- Agent extension mappings (optional)
-    recording = "RecordingType_qa.json"             -- Recording type definitions (optional)
+    ivr = "ivr-cc-config/ivrconfig.json",           -- IVR flow and node definitions
+    webapi = "ivr-cc-config/automax_webAPIConfig.json",  -- API endpoint configurations
+    extensions = "ivr-cc-config/Extensions_qa.json",     -- Agent extension mappings
+    recording = "ivr-cc-config/RecordingType_qa.json"    -- Recording type definitions
 }
 
 -- Configuration last-modified timestamps
@@ -251,7 +251,7 @@ end
 
 --------------------------------------------------------------------------------
 -- Get Web API Endpoints
---
+-- 
 -- Convenience function to get the web API endpoint configurations.
 --
 -- @return table|nil - The API endpoints configuration or nil if not loaded
@@ -262,28 +262,6 @@ function M.get_webapi_endpoints()
         return webapi_config.result
     end
     return nil
-end
-
---------------------------------------------------------------------------------
--- Get Recording Configuration
---
--- Convenience function to get the recording type configurations.
---
--- @return table|nil - The recording configuration or nil if not loaded
---------------------------------------------------------------------------------
-function M.get_recording_config()
-    return M.get("recording")
-end
-
---------------------------------------------------------------------------------
--- Get Agent Extensions
---
--- Convenience function to get the agent extension configurations.
---
--- @return table|nil - The extensions configuration or nil if not loaded
---------------------------------------------------------------------------------
-function M.get_agent_extensions()
-    return M.get("extensions")
 end
 
 return M

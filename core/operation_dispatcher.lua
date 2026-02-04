@@ -10,7 +10,7 @@
 -- - 20, 105: Input collection operations
 -- - 40, 341: Recording operations
 -- - 100, 101, 107, 108: Transfer operations
--- - 111, 112: API integration operations
+-- - 111, 112, 222: API integration operations
 -- - 120: Logic/conditional operations
 -- - 200: Call termination
 -- - 330, 331: Text-to-speech operations
@@ -55,6 +55,7 @@ local operation_map = {
     [112] = "api",      -- API POST request
     [120] = "logic",    -- Conditional logic/branching
     [200] = "termination", -- Terminate call
+    [222] = "api",      -- API query creation/authentication
     [330] = "tts",      -- Text-to-speech
     [331] = "tts",      -- Text-to-speech with input
     [341] = "recording" -- Record with options

@@ -226,7 +226,6 @@ function M.play_and_get_input(node_data)
     
     if not session or not session:ready() then
         logger:error("Session is not ready")
-        logger:error(tostring(node_data))
         return
     end
     
@@ -255,76 +254,44 @@ function M.play_and_get_input(node_data)
     end
     
     -- Get timeout (default 5 seconds)
-    local timeout = node_data.InputTimeLimit or node_data.TimeoutInSec or 5
+    local timeout = node_data.TimeoutInSec or 5
     local timeout_ms = timeout * 1000
-
-    -- Build regex pattern: "1,2" → "1|2"
-    local dtmf_regex = node_data.ValidKeys:gsub(",", "|")
-    -- Escape asterisk for regex: "*" → "\\*"
-    dtmf_regex = dtmf_regex:gsub("%*", "\\*")
-
+    
     logger:debug(string.format(
-        "Playing audio with input collection: %s (timeout: %d ms, regex: %s)",
-        audio_file, timeout_ms, dtmf_regex
+        "Playing audio with input collection: %s (timeout: %d seconds, valid keys: %s)",
+        audio_file, timeout, node_data.ValidKeys
     ))
-
+    
     -- Play and get digits
-    -- FreeSWITCH playAndGetDigits signature (8 args):
-    -- min_digits, max_digits, max_tries, timeout, terminators, audio_file, invalid_audio, regex
+    -- The play_and_get_digits arguments:
+    -- min_digits, max_digits, max_tries, timeout, terminator, file, invalid_file, 
+    -- variable_name, regex, digit_timeout, transfer_on_failure
     local digits = session:playAndGetDigits(
-        1,              -- min digits
-        1,              -- max digits
-        3,              -- max tries
-        timeout_ms,     -- timeout in milliseconds
-        "",             -- terminator
-        audio_file,     -- audio file to play
-        "",             -- invalid audio (handled separately)
-        dtmf_regex      -- regex for valid input
+        1,                          -- min digits
+        1,                          -- max digits
+        3,                          -- max tries
+        timeout_ms,                 -- timeout in milliseconds
+        "",                         -- terminator (none for single digit)
+        audio_file,                 -- audio file to play
+        "",                         -- invalid audio (handled separately)
+        "ivr_dtmf_input",           -- variable to store result
+        "[" .. node_data.ValidKeys .. "]",  -- regex for valid input
+        timeout_ms,                 -- digit timeout
+        ""                          -- transfer on failure
     )
     
     logger:info(string.format("Collected DTMF input: %s", tostring(digits)))
-
-    -- Store the input in a session variable using TagName from config
+    
+    -- Store the input in a session variable
+    session_manager.set_variable("last_dtmf_input", digits)
+    
+    -- Route to child node based on input
     if digits and digits ~= "" then
-        -- Store input using TagName if specified
-        if node_data.TagName then
-            local value_to_store = digits
-
-            -- Apply TagValuePrefix if specified
-            if node_data.TagValuePrefix and node_data.TagValuePrefix ~= "" then
-                value_to_store = node_data.TagValuePrefix .. digits
-                logger:debug(string.format("Applied prefix '%s' to input: %s",
-                    node_data.TagValuePrefix, value_to_store))
-            end
-
-            session_manager.set_variable(node_data.TagName, value_to_store)
-            logger:info(string.format("Stored DTMF input in session variable '%s' = '%s'",
-                node_data.TagName, value_to_store))
-        else
-            -- Fallback to generic variable name if TagName not specified
-            session_manager.set_variable("last_dtmf_input", digits)
-            logger:debug("No TagName specified, stored in 'last_dtmf_input'")
-        end
-
         call_flow.find_child_node_with_dtmf_input(digits, node_data)
     else
         -- No input received - handle timeout or invalid input
         logger:warning("No valid input received")
-
-        -- Use default input if specified
-        if node_data.DeafultInput and node_data.DeafultInput ~= "" then
-            logger:info(string.format("Using default input: %s", node_data.DeafultInput))
-
-            if node_data.TagName then
-                session_manager.set_variable(node_data.TagName, node_data.DeafultInput)
-                logger:info(string.format("Stored default input in '%s' = '%s'",
-                    node_data.TagName, node_data.DeafultInput))
-            end
-
-            call_flow.find_child_node_with_dtmf_input(node_data.DeafultInput, node_data)
-        else
-            call_flow.handle_invalid_input(node_data)
-        end
+        call_flow.handle_invalid_input(node_data)
     end
 end
 

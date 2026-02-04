@@ -45,21 +45,37 @@ local logger = logging.get_logger("json_utils")
 --------------------------------------------------------------------------------
 function M.decode(json_string)
     if not json_string or json_string == "" then
+        logger:warning("JSON decode called with empty or nil string")
         return false, "JSON string is empty or nil"
     end
-    
+
+    -- Log basic info about the input
+    logger:debug(string.format("Attempting to decode JSON (length: %d)", #json_string))
+
     -- Attempt to decode the JSON
     local success, result = pcall(function()
         return json.decode(json_string)
     end)
-    
+
     if not success then
-        logger:error(string.format("JSON decode failed: %s", tostring(result)))
-        logger:debug(string.format("Failed JSON string: %s", 
-            json_string:sub(1, 200)))  -- Log first 200 chars for debugging
+        logger:error(string.format("[ERROR] JSON decode failed: %s", tostring(result)))
+        logger:error(string.format("[ERROR] JSON string length: %d", #json_string))
+        logger:error(string.format("[ERROR] First 500 chars: %s", json_string:sub(1, 500)))
+
+        -- Log hex dump of first 50 bytes for debugging encoding issues
+        local hex_dump = ""
+        for i = 1, math.min(50, #json_string) do
+            hex_dump = hex_dump .. string.format("%02X ", string.byte(json_string, i))
+            if i % 16 == 0 then
+                hex_dump = hex_dump .. "\n"
+            end
+        end
+        logger:error(string.format("[ERROR] Hex dump (first 50 bytes):\n%s", hex_dump))
+
         return false, "JSON decode error: " .. tostring(result)
     end
-    
+
+    logger:debug("JSON decode successful")
     return true, result
 end
 

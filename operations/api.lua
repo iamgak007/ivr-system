@@ -4,6 +4,7 @@
 -- Handles all API integration related operations including:
 -- - Operation 111: API call (GET/POST with various content types)
 -- - Operation 112: Simple API POST call
+-- - Operation 222: API query creation/authentication call
 --
 -- These operations interact with external web services to fetch data,
 -- authenticate, create incidents, etc.
@@ -36,7 +37,7 @@ local logger = logging.get_logger("operations.api")
 -- Main entry point for all API operations. Routes to specific handlers
 -- based on operation code.
 --
--- @param operation_code number - The operation code (111, 112)
+-- @param operation_code number - The operation code (111, 112, 222)
 -- @param node_data table - The IVR node configuration data
 -- @return void
 --------------------------------------------------------------------------------
@@ -48,6 +49,10 @@ function M.execute(operation_code, node_data)
         M.api_call(node_data)
     elseif operation_code == 112 then
         M.api_post(node_data)
+    elseif operation_code == 222 then
+        -- Operation 222: API query creation/authentication
+        -- Uses same handler as operation 111
+        M.api_call(node_data)
     else
         error(string.format("Unknown API operation code: %d", operation_code))
     end
@@ -95,9 +100,16 @@ end
 local function convert_to_values_format(tbl)
     local values_array = {}
     for key, value in pairs(tbl) do
+        local value_str
+        if type(value) == "table" then
+            local success, encoded = json_utils.encode(value)
+            value_str = success and encoded or tostring(value)
+        else
+            value_str = tostring(value)
+        end
         table.insert(values_array, {
             name = key,
-            value = type(value) == "table" and json_utils.encode(value) or tostring(value)
+            value = value_str
         })
     end
     return {
@@ -357,10 +369,24 @@ local function map_indices_to_uuids(session)
     else
         logger:error("Failed to fetch locations from API")
     end
-    
+
+    -- Set Title of Incident
+    if classifications and locations then
+        local incident_title_en = "Incident - " .. (classifications[1] and classifications[1].name or "Unknown") ..
+                                      " at " .. (locations[1] and locations[1].name or "Unknown Location")
+        local incident_title_ar = "حادث - " ..
+                                      (classifications[1] and classifications[1].name or "غير معروف") ..
+                                      " في " .. (locations[1] and locations[1].name or "موقع غير معروف")
+        session:setVariable("IncidentTitleTextEn", incident_title_en)
+        session:setVariable("IncidentTitleTextAr", incident_title_ar)
+        logger:info("==> FINAL: Set IncidentTitleTextEn to: " .. incident_title_en)
+        logger:info("==> FINAL: Set IncidentTitleTextAr to: " .. incident_title_ar)
+    end
+
     -- Fetch Workflow
     logger:info("Fetching workflow from API: https://ax3.automaxsw.com/api/v1/admin/workflows?record_type=incident")
-    local workflows = fetch_api_data("https://ax3.automaxsw.com/api/v1/admin/workflows?record_type=incident", access_token)
+    local workflows = fetch_api_data("https://ax3.automaxsw.com/api/v1/admin/workflows?record_type=incident",
+        access_token)
     if workflows then
         logger:info(string.format("Successfully fetched %d workflow(s)", #workflows))
 
@@ -376,7 +402,6 @@ local function map_indices_to_uuids(session)
         logger:error("Failed to fetch workflows from API")
     end
 end
-
 --------------------------------------------------------------------------------
 -- Helper: Construct API call
 --
@@ -386,37 +411,49 @@ end
 -- @param content_type string - Content type
 -- @param service_url string - Base URL
 -- @param api_input_data table - Input configuration
+-- @param api_type number - API type (1=auth, other types may use values format)
 -- @return string - Constructed curl command
 --------------------------------------------------------------------------------
-local function construct_api(method_type, content_type, service_url, api_input_data)
+local function construct_api(method_type, content_type, service_url, api_input_data, api_type)
     local session = session_manager.get_freeswitch_session()
     local payload = {}
     local headers = ""
     local form_data = ""
     local binary_data = ""
 
-    logger:debug("Constructing API call")
+    logger:info("=== CONSTRUCTING API CALL ===")
+    logger:info(string.format("Method: %s, Content-Type: %s", method_type, content_type))
+    logger:info("Base URL: " .. service_url)
 
     local input_array = api_input_data.headers or api_input_data.values or api_input_data
+    logger:info(string.format("Processing %d input configuration items", #input_array))
 
     for _, item in ipairs(input_array) do
         local input_type = item.InputType
+        logger:debug(string.format("Processing item: Type=%s, Field=%s, ValueType=%s", input_type or "nil",
+            item.FieldName or "nil", item.InputValueType or "nil"))
 
         if input_type == "U" then
             -- URL parameter
             local input_value
             if item.InputValueType == "D" or item.InputValueType == "E" then
                 input_value = session:getVariable(item.InputValue)
+                logger:info(string.format("  [URL_PARAM] Getting variable '%s' = '%s'", item.InputValue,
+                    tostring(input_value)))
+                logger:info(string.format("  [URL_PARAM] Replacing {%s} in URL", item.FieldName))
                 service_url = replace_placeholder(service_url, '{' .. item.FieldName .. '}', input_value)
+                logger:info(string.format("  [URL_PARAM] Updated URL: %s", service_url))
             elseif item.InputValueType == "S" then
+                logger:info(string.format("  [URL_PARAM] Using static value '%s' for {%s}", item.InputValue,
+                    item.FieldName))
                 service_url = replace_placeholder(service_url, '{' .. item.FieldName .. '}', item.InputValue)
+                logger:info(string.format("  [URL_PARAM] Updated URL: %s", service_url))
             end
 
         elseif input_type == "R" then
             -- Request body parameter
             local key = item.FieldName or item.name
             local val
-            local default_value = item.DefaultValue
 
             if item.InputValueType == "D" or item.InputValueType == "E" then
                 local raw_input = item.InputValue or item.value
@@ -424,25 +461,20 @@ local function construct_api(method_type, content_type, service_url, api_input_d
 
                 if variable_name then
                     val = session:getVariable(variable_name)
-                    logger:debug(string.format("Variable {{%s}} = %s", variable_name, tostring(val)))
-                    if val and val ~= "" then
+                    logger:info(string.format("  [REQUEST BODY] Getting variable '%s' = '%s'", variable_name,
+                        tostring(val)))
+                    if val then
                         val = tostring(val):gsub('^"(.*)"$', '%1')
                         val = tostring(raw_input):gsub("{{" .. variable_name .. "}}", val)
-                    elseif default_value then
-                        -- Use default value if variable not set
-                        val = default_value
-                        logger:debug(string.format("Using default value for %s: %s", key, default_value))
-                    else
-                        val = nil
                     end
                 else
                     val = session:getVariable(item.InputValue)
-                    if (not val or val == "") and default_value then
-                        val = default_value
-                    end
+                    logger:info(string.format("  [REQUEST BODY] Getting variable '%s' = '%s'", item.InputValue,
+                        tostring(val)))
                 end
             else
                 val = item.value or item.InputValue
+                logger:info(string.format("  [REQUEST BODY] Using static value '%s' = '%s'", key, tostring(val)))
                 if val then
                     if key == "Map" then
                         payload[key] = {
@@ -455,11 +487,9 @@ local function construct_api(method_type, content_type, service_url, api_input_d
                 end
             end
 
-            -- Only add to payload if we have a value
-            if key and val and val ~= "" and key ~= "Map" then
+            if key and val and key ~= "Map" then
                 payload[key] = val
-            elseif key and default_value and key ~= "Map" then
-                payload[key] = default_value
+                logger:info(string.format("  [REQUEST BODY] Added to payload: %s = %s", key, tostring(val)))
             end
 
         elseif input_type == "B" then
@@ -477,118 +507,160 @@ local function construct_api(method_type, content_type, service_url, api_input_d
             local input_value
             if item.InputValueType == "D" or item.InputValueType == "E" then
                 input_value = session:getVariable(item.InputValue)
+                logger:info(string.format("  [FORM_DATA] Getting variable '%s' = '%s'", item.InputValue,
+                    tostring(input_value)))
             elseif item.InputValueType == "S" then
                 input_value = item.InputValue
+                logger:info(string.format("  [FORM_DATA] Using static value '%s' = '%s'", item.FieldName,
+                    tostring(input_value)))
             end
 
             if input_value and string.find(input_value, "%.wav$") then
                 form_data = form_data .. " -F " .. item.FieldName .. "=@" .. input_value
+                logger:info(string.format("  [FORM_DATA] Added file field: %s = @%s", item.FieldName, input_value))
             else
                 form_data = form_data .. " -F " .. item.FieldName .. "=" .. (input_value or "")
+                logger:info(string.format("  [FORM_DATA] Added field: %s = %s", item.FieldName,
+                    tostring(input_value or "")))
             end
 
         elseif input_type == "H" then
             -- Header
             local field_name = item.FieldName or item.name
-            local input_value = item.InputValue or item.value
 
             if item.InputValueType == "D" or item.InputValueType == "E" then
-                -- Check for double braces pattern {{variable}}
-                local double_brace_var = input_value:match("{{(.-)}}")
-                -- Check for single brace pattern {variable}
-                local single_brace_var = input_value:match("{(.-)}")
+                local input_value = item.InputValue or item.value
+                logger:info(string.format("  [HEADER] Processing: %s, Raw value: '%s'", field_name,
+                    tostring(input_value)))
 
-                if double_brace_var then
-                    local var_value = session:getVariable(double_brace_var)
-                    logger:debug(string.format("Header variable {{%s}} = %s", double_brace_var, tostring(var_value)))
-                    if var_value then
-                        input_value = input_value:gsub("{{" .. double_brace_var .. "}}", var_value)
-                    end
+                -- Handle both {{variable}} and {variable} syntax
+                local variable_name = input_value:match("{{(.-)}}") or input_value:match("{(.-)}")
+
+                if variable_name then
+                    logger:info(string.format("  [HEADER] Extracted variable name: '%s'", variable_name))
+                    local updated_value = session:getVariable(variable_name)
+                    logger:info(string.format("  [HEADER] Variable '%s' value: '%s'", variable_name,
+                        tostring(updated_value)))
+
+                    -- Replace both double-brace and single-brace patterns
+                    input_value = input_value:gsub("{{" .. variable_name .. "}}", updated_value or "")
+                    input_value = input_value:gsub("{" .. variable_name .. "}", updated_value or "")
+
                     headers = headers .. field_name .. ": " .. input_value
-                elseif single_brace_var then
-                    local var_value = session:getVariable(single_brace_var)
-                    logger:debug(string.format("Header variable {%s} = %s", single_brace_var, tostring(var_value)))
-                    if var_value then
-                        input_value = input_value:gsub("{" .. single_brace_var .. "}", var_value)
-                    end
-                    headers = headers .. field_name .. ": " .. input_value
+                    logger:info(string.format("  [HEADER] %s: %s", field_name, input_value))
                 else
-                    local dynamic_value = session:getVariable(input_value)
-                    logger:debug(string.format("Header direct variable %s = %s", input_value, tostring(dynamic_value)))
-                    headers = headers .. field_name .. ": " .. (dynamic_value or "")
+                    local dynamic_value = session:getVariable(item.InputValue)
+                    logger:info(string.format("  [HEADER] Direct variable '%s' value: '%s'", item.InputValue,
+                        tostring(dynamic_value)))
+                    headers = headers .. item.FieldName .. ": " .. (dynamic_value or "")
+                    logger:info(string.format("  [HEADER] %s: %s", item.FieldName, dynamic_value or ""))
                 end
             elseif item.InputValueType == "S" then
-                headers = headers .. field_name .. ": " .. input_value
+                headers = headers .. item.FieldName .. ": " .. item.InputValue
+                logger:info(string.format("  [HEADER] %s: %s", item.FieldName, item.InputValue))
             end
-
-            logger:debug(string.format("Added header: %s", field_name))
         end
     end
 
-    logger:info(string.format("Constructed headers: %s", headers))
-
     -- Build final API command
-    logger:debug("Service URL: " .. service_url)
-    local final_api = service_url .. " -s -w '+%{http_code}' "
+    logger:info("=== BUILDING FINAL API COMMAND ===")
+    logger:info("Final URL: " .. service_url)
+
+    -- Start building curl command
+    local final_api = "curl --location '" .. service_url .. "' -s -w '+%{http_code}'"
 
     if content_type == "multipart/form-data" then
+        logger:info("=== MULTIPART/FORM-DATA REQUEST ===")
+        logger:info("Form data fields: " .. form_data)
         headers = string.gsub(headers, '"', '')
-        final_api = "curl -s -w '+%{http_code}' -X " .. method_type .. " -H '" .. headers .. "' " .. form_data .. " " ..
-                        final_api
+        if #headers > 0 then
+            logger:info("Headers: " .. headers)
+            final_api = final_api .. " --header '" .. headers .. "'"
+        end
+        final_api = final_api .. " -X " .. method_type .. " " .. form_data
+        logger:info("[ATTACHMENT_UPLOAD] Multipart form-data request constructed")
 
     elseif content_type == "audio/wav" then
         headers = string.gsub(headers, '"', '')
-        final_api = "curl -s -w '+%{http_code}' -X " .. method_type .. " -H '" .. headers .. "' -H 'Content-Type: " ..
-                        content_type .. "' " .. binary_data .. " " .. final_api
+        if #headers > 0 then
+            final_api = final_api .. " --header '" .. headers .. "'"
+        end
+        final_api = final_api .. " --header 'Content-Type: " .. content_type .. "'"
+        final_api = final_api .. " -X " .. method_type .. " " .. binary_data
 
     else
+        -- Standard JSON/form-data request
         if content_type then
-            final_api = final_api .. " -H \"Content-Type: " .. content_type .. "\""
-        end
-
-        if next(payload) ~= nil then
-            local encoded_payload
-
-            -- Log payload contents
-            logger:info("Payload fields:")
-            for k, v in pairs(payload) do
-                logger:info(string.format("  %s = %s", tostring(k), tostring(v)))
-            end
-
-            if content_type == "application/x-www-form-urlencoded" then
-                encoded_payload = urlencode_table(payload)
-            elseif content_type == "application/json" then
-                -- Encode payload directly as JSON (don't wrap in values format)
-                local success, json_str = json_utils.encode(payload)
-                if success then
-                    encoded_payload = json_str
-                else
-                    logger:error("Failed to encode JSON payload")
-                    encoded_payload = "{}"
-                end
-            else
-                local success, json_str = json_utils.encode(payload)
-                if success then
-                    encoded_payload = json_str
-                else
-                    encoded_payload = "{}"
-                end
-            end
-
-            encoded_payload = encoded_payload:gsub("\n", "")
-            logger:info("Encoded payload: " .. encoded_payload)
-            final_api = final_api .. " -X " .. method_type .. " -d '" .. encoded_payload .. "'"
-        else
-            logger:info("No payload to send")
+            final_api = final_api .. " --header 'Content-Type: " .. content_type .. "'"
         end
 
         if #headers > 0 then
             headers = string.gsub(headers, '"', '')
-            final_api = final_api .. " -H \"" .. headers .. "\""
+            final_api = final_api .. " --header '" .. headers .. "'"
+        end
+
+        if next(payload) ~= nil then
+            logger:info("=== PAYLOAD DATA ===")
+            for k, v in pairs(payload) do
+                logger:info(string.format("  %s = %s", k, tostring(v)))
+            end
+
+            local encoded_payload
+
+            if content_type == "application/x-www-form-urlencoded" then
+                encoded_payload = urlencode_table(payload)
+                logger:info("Encoded as URL-encoded: " .. encoded_payload)
+            elseif content_type == "application/json" then
+                local classification_value = session:getVariable("ClassificationIdEn") or
+                                                 session:getVariable("ClassificationIdAr")
+                if classification_value then
+                    payload["Classification"] = classification_value
+                    logger:info("  Added Classification = " .. classification_value)
+                end
+
+                -- ApiType 1 = Authentication, use simple JSON format
+                -- Other types may need values array format
+                if api_type == 1 then
+                    logger:info("Using simple JSON format (authentication API)")
+                    local success, result = json_utils.encode(payload)
+                    if not success then
+                        logger:error("[ERROR] JSON encode failed for authentication API: " .. tostring(result))
+                    end
+                    encoded_payload = success and result or "{}"
+                else
+                    logger:info("Converting to values format for API")
+                    local converted = convert_to_values_format(payload)
+                    logger:info("Converted payload structure:")
+                    if converted.values then
+                        logger:info("  Number of values: " .. tostring(#converted.values))
+                        for i, item in ipairs(converted.values) do
+                            logger:info(string.format("  [%d] %s = %s", i, item.name, tostring(item.value)))
+                        end
+                    end
+                    local success, result = json_utils.encode(converted)
+                    if not success then
+                        logger:error("[ERROR] JSON encode failed for values format: " .. tostring(result))
+                    end
+                    encoded_payload = success and result or "{}"
+                end
+                logger:info("Encoded JSON payload length: " .. tostring(#encoded_payload))
+                logger:info("Encoded JSON payload: " .. encoded_payload)
+            else
+                local success, result = json_utils.encode(payload)
+                if not success then
+                    logger:error("[ERROR] JSON encode failed (default): " .. tostring(result))
+                end
+                encoded_payload = success and result or "{}"
+                logger:info("Encoded as JSON (default): " .. encoded_payload)
+            end
+
+            encoded_payload = encoded_payload:gsub("\n", "")
+            final_api = final_api .. " --data-raw '" .. encoded_payload .. "'"
         end
     end
 
-    logger:info("Final curl command: " .. final_api)
+    logger:info("=== FINAL CURL COMMAND ===")
+    logger:info(final_api)
     return final_api
 end
 
@@ -628,11 +700,10 @@ function M.upload_incident_attachments(incident_id, source_api_id)
     local lang_suffix = (source_api_id == 11) and "Ar" or "En"
 
     -- List of possible recording variables to check
-    local recording_vars = {
-        "CallerName" .. lang_suffix,           -- Incident caller name
-        "IncidentDetails" .. lang_suffix,      -- Incident description
-        "CmplntCallerName" .. lang_suffix,     -- Complaint caller name
-        "CmplntDetails" .. lang_suffix         -- Complaint details
+    local recording_vars = {"CallerName" .. lang_suffix, -- Incident caller name
+    "IncidentDetails" .. lang_suffix, -- Incident description
+    "CmplntCallerName" .. lang_suffix, -- Complaint caller name
+    "CmplntDetails" .. lang_suffix -- Complaint details
     }
 
     local attachments_uploaded = 0
@@ -646,7 +717,7 @@ function M.upload_incident_attachments(incident_id, source_api_id)
 
             -- Set the recording path and incident ID in session for the API
             session:setVariable("recording_file_path", recording_path)
-            session:setVariable("incident_id_response", incident_id)
+            session:setVariable("incident_no_response", incident_id)
 
             -- Build the attachment upload API call
             local web_api_data = config.get_webapi_endpoints()
@@ -684,12 +755,8 @@ function M.upload_incident_attachments(incident_id, source_api_id)
             end
 
             -- Construct and execute the attachment upload API call
-            local final_api = construct_api(
-                attachment_api.methodType,
-                attachment_api.inputMediaType,
-                attachment_api.serviceURL,
-                api_input_data
-            )
+            local final_api = construct_api(attachment_api.methodType, attachment_api.inputMediaType,
+                attachment_api.serviceURL, api_input_data)
 
             logger:info("Executing attachment upload: curl " .. final_api)
             local curl_cmd = "curl " .. final_api
@@ -704,7 +771,8 @@ function M.upload_incident_attachments(incident_id, source_api_id)
                 logger:info(string.format("Attachment uploaded successfully: %s", var_name))
                 attachments_uploaded = attachments_uploaded + 1
             else
-                logger:error(string.format("Failed to upload attachment %s, HTTP code: %s", var_name, tostring(response_code)))
+                logger:error(string.format("Failed to upload attachment %s, HTTP code: %s", var_name,
+                    tostring(response_code)))
             end
         else
             logger:debug(string.format("No recording found for variable: %s", var_name))
@@ -712,7 +780,8 @@ function M.upload_incident_attachments(incident_id, source_api_id)
     end
 
     if attachments_uploaded > 0 then
-        logger:info(string.format("Successfully uploaded %d attachment(s) to incident %s", attachments_uploaded, incident_id))
+        logger:info(string.format("Successfully uploaded %d attachment(s) to incident %s", attachments_uploaded,
+            incident_id))
     else
         logger:info("No attachments to upload")
     end
@@ -731,7 +800,8 @@ end
 -- @return void
 --------------------------------------------------------------------------------
 function M.api_call(node_data)
-    logger:info(string.format("Operation 111: API call for node %d", node_data.NodeId))
+    logger:info("=== OPERATION 111/222: API CALL ===")
+    logger:info(string.format("Node ID: %d, Node Name: %s", node_data.NodeId, node_data.NodeName or "Unknown"))
 
     local session = session_manager.get_freeswitch_session()
 
@@ -743,6 +813,24 @@ function M.api_call(node_data)
     local api_id = node_data.APIId
     logger:info("API ID: " .. tostring(api_id))
 
+    -- Log specific info for complaint/incident APIs
+    if api_id == 10 then
+        logger:info("[AUTHENTICATION] Auth API call")
+    elseif api_id == 13 then
+        logger:info("[COMPLAINT_CREATE] Create Complaint API - AR")
+    elseif api_id == 16 then
+        logger:info("[COMPLAINT_CREATE] Create Complaint API - EN")
+    elseif api_id == 24 then
+        logger:info("[COMPLAINT_ATTACHMENT] Upload Complaint Attachment - AR")
+    elseif api_id == 25 then
+        logger:info("[COMPLAINT_ATTACHMENT] Upload Complaint Attachment - EN")
+    elseif api_id == 11 then
+        logger:info("[INCIDENT_CREATE] Create Incident API - AR")
+    elseif api_id == 12 then
+        logger:info("[INCIDENT_CREATE] Create Incident API - EN")
+    elseif api_id == 23 then
+        logger:info("[INCIDENT_ATTACHMENT] Upload Incident Attachment")
+    end
     -- For incident creation APIs (11, 12), map indices to UUIDs first
     if api_id == 11 or api_id == 12 then
         logger:info("Incident creation API detected - mapping indices to UUIDs")
@@ -752,10 +840,8 @@ function M.api_call(node_data)
         local lang_suffix = (api_id == 11) and "Ar" or "En"
         local desc_text = session:getVariable("IncidentDetailsText" .. lang_suffix)
         local desc_audio = session:getVariable("IncidentDetails" .. lang_suffix)
-        logger:info(string.format("Description values - Text: %s, Audio: %s",
-            tostring(desc_text), tostring(desc_audio)))
+        logger:info(string.format("Description values - Text: %s, Audio: %s", tostring(desc_text), tostring(desc_audio)))
     end
-
     -- Get API configuration
     local web_api_data = config.get_webapi_endpoints()
 
@@ -765,24 +851,26 @@ function M.api_call(node_data)
         return
     end
 
-    local method_type, content_type, service_url, api_input_data, api_output
+    local method_type, content_type, service_url, api_input_data, api_output, api_type
 
     for _, api in pairs(web_api_data) do
         if api.apiId == api_id then
             method_type = api.methodType
             content_type = api.inputMediaType
             service_url = api.serviceURL
+            api_type = api.apiType
 
             if type(api.apiInput) == "string" then
-                local success, decoded = json_utils.decode(api.apiInput)
+                local success, decoded_data = json_utils.decode(api.apiInput)
                 if success then
-                    api_input_data = decoded
+                    api_input_data = decoded_data
                 else
-                    logger:error("Failed to decode apiInput: " .. tostring(decoded))
+                    logger:error(string.format("Failed to decode apiInput for API ID %d: %s", api_id,
+                        tostring(decoded_data)))
                     api_input_data = {}
                 end
             else
-                api_input_data = api.apiInput or {}
+                api_input_data = api.apiInput
             end
 
             api_output = api.apiOutput
@@ -796,195 +884,528 @@ function M.api_call(node_data)
         return
     end
 
-    logger:info(string.format("API config - Method: %s, ContentType: %s, URL: %s", method_type, content_type,
-        service_url))
+    -- Validate api_input_data
+    if not api_input_data or type(api_input_data) ~= "table" then
+        logger:error(string.format("Invalid API input data for API ID %d (type: %s). Expected table, got: %s", api_id,
+            type(api_input_data), tostring(api_input_data)))
+        -- Use empty table as fallback
+        api_input_data = {}
+    end
+
+    logger:info(string.format("API config - Method: %s, ContentType: %s, URL: %s, ApiType: %s", method_type,
+        content_type, service_url, tostring(api_type)))
+
+    -- Set default values for complaint creation APIs
+    if api_id == 13 or api_id == 16 then
+        logger:info("[COMPLAINT_CREATE] Setting default values for complaint creation")
+
+        local lang_suffix = (api_id == 13) and "Ar" or "En"
+
+        -- Set title from caller ID if not already set
+        local title_var = "ComplaintTitleText" .. lang_suffix
+        if not session:getVariable(title_var) then
+            local caller_id = session:getVariable("caller_id_number") or "IVR Caller"
+            local timestamp = os.date("%Y-%m-%d %H:%M:%S")
+            local title = "Complaint from " .. caller_id .. " at " .. timestamp
+            session:setVariable(title_var, title)
+            logger:info(string.format("[COMPLAINT_CREATE] Set %s = %s", title_var, title))
+        end
+
+        -- Save the audio file path for attachment upload before overwriting
+        local details_var = "ComplaintDetailsText" .. lang_suffix
+        local current_value = session:getVariable(details_var)
+
+        if current_value and current_value:match("%.wav$") then
+            -- It's a file path, save it for attachment upload
+            local file_path_var = "CmplntDetails" .. lang_suffix
+            session:setVariable(file_path_var, current_value)
+            logger:info(string.format("[COMPLAINT_CREATE] Saved file path to %s = %s", file_path_var, current_value))
+        end
+
+        -- Map Querry text (from STT) to Complaint details
+        local querry_text = session:getVariable("QuerryDetailsText" .. lang_suffix)
+
+        if querry_text and querry_text ~= "" then
+            -- STT succeeded, use the transcribed text
+            session:setVariable(details_var, querry_text)
+            logger:info(string.format("[COMPLAINT_CREATE] Using STT text for %s = %s", details_var, querry_text))
+        else
+            -- STT failed or no text, use default
+            local default_desc = "Complaint details provided via IVR. Please check attached audio recording."
+            session:setVariable(details_var, default_desc)
+            logger:info(string.format("[COMPLAINT_CREATE] Set default description (STT failed or no text)"))
+        end
+
+        -- Set classification ID if not already set (use default from API config)
+        local classification_var = "ClassificationId" .. lang_suffix
+        if not session:getVariable(classification_var) then
+            local default_classification = "6f2c826b-46a4-4d96-bfbc-7d60b2602872" -- Central PWD
+            session:setVariable(classification_var, default_classification)
+            logger:info(string.format("[COMPLAINT_CREATE] Set default %s = %s", classification_var,
+                default_classification))
+        end
+
+        -- Set workflow ID if not already set (use default from API config)
+        local workflow_var = "WorkflowId" .. lang_suffix
+        if not session:getVariable(workflow_var) then
+            local default_workflow = "ed0d2140-3db3-40ab-a609-baa7b415657e" -- Complaint management
+            session:setVariable(workflow_var, default_workflow)
+            logger:info(string.format("[COMPLAINT_CREATE] Set default %s = %s", workflow_var, default_workflow))
+        end
+    end
+
+    -- Map variables for complaint attachment upload APIs
+    if api_id == 24 or api_id == 25 then
+        logger:info("[COMPLAINT_ATTACHMENT] Mapping variables for attachment upload")
+
+        local lang_suffix = (api_id == 24) and "Ar" or "En"
+
+        -- Map ComplaintDetailsTextEn/Ar to CmplntDetailsEn/Ar for file path
+        local file_var = "CmplntDetails" .. lang_suffix
+        if not session:getVariable(file_var) then
+            -- Try to get from ComplaintDetailsTextEn/Ar (recording file path)
+            local recording_var = "ComplaintDetailsText" .. lang_suffix
+            local file_path = session:getVariable(recording_var)
+
+            if not file_path then
+                -- Try QuerryDetailsTextEn/Ar as alternative
+                recording_var = "QuerryDetailsText" .. lang_suffix
+                file_path = session:getVariable(recording_var)
+            end
+
+            if file_path then
+                session:setVariable(file_var, file_path)
+                logger:info(string.format("[COMPLAINT_ATTACHMENT] Mapped %s to %s = %s", recording_var, file_var,
+                    file_path))
+            else
+                logger:warning(string.format("[COMPLAINT_ATTACHMENT] No recording file path found for %s", file_var))
+            end
+        else
+            logger:info(string.format("[COMPLAINT_ATTACHMENT] %s already set = %s", file_var,
+                session:getVariable(file_var)))
+        end
+    end
 
     -- Construct and execute API call
-    local final_api = construct_api(method_type, content_type, service_url, api_input_data)
-    logger:debug("Final API command: " .. final_api)
+    local final_api = construct_api(method_type, content_type, service_url, api_input_data, api_type)
+    logger:info("=== API CALL DETAILS ===")
+    logger:info(string.format("API ID: %d, Method: %s, Content-Type: %s", api_id, method_type, content_type))
+    logger:info("Full curl command: " .. final_api)
 
     local input_keys = "F"
 
     if content_type == "application/json" then
-        local curl_cmd = "curl " .. final_api
-        logger:info("Executing curl: " .. curl_cmd)
-        local api_response = execute_command(curl_cmd)
+        -- final_api already contains the complete curl command
+        logger:info("Executing curl command...")
+        local api_response = execute_command(final_api)
 
-        logger:info("Raw API response: " .. tostring(api_response))
+        logger:info("=== RAW API RESPONSE ===")
+        logger:info("Response length: " .. tostring(#api_response))
+        logger:info("Raw response (first 500 chars): " .. tostring(api_response:sub(1, 500)))
+        logger:info("Raw response (full): " .. tostring(api_response))
 
         -- Parse response code
         local response_code = tonumber(api_response:match("%+(%d+)$"))
         local response_body = api_response:gsub("%+%d+$", "")
 
-        logger:info("HTTP response code: " .. tostring(response_code))
-        logger:info("Response body: " .. tostring(response_body))
+        logger:info("=== PARSED API RESPONSE ===")
+        logger:info("HTTP status code: " .. tostring(response_code))
+        logger:info("Response body length: " .. tostring(#response_body))
+        logger:info("Response body (first 500 chars): " .. tostring(response_body:sub(1, 500)))
+        logger:info("Response body (full): " .. tostring(response_body))
+
+        -- Log specific info for complaint/incident APIs
+        if api_id == 13 or api_id == 16 then
+            logger:info("[COMPLAINT_CREATE] API ID " .. tostring(api_id) .. " - HTTP " .. tostring(response_code))
+        elseif api_id == 24 or api_id == 25 then
+            logger:info("[COMPLAINT_ATTACHMENT] API ID " .. tostring(api_id) .. " - HTTP " .. tostring(response_code))
+        elseif api_id == 11 or api_id == 12 then
+            logger:info("[INCIDENT_CREATE] API ID " .. tostring(api_id) .. " - HTTP " .. tostring(response_code))
+        elseif api_id == 23 then
+            logger:info("[INCIDENT_ATTACHMENT] API ID " .. tostring(api_id) .. " - HTTP " .. tostring(response_code))
+        end
 
         if response_code and response_code >= 200 and response_code < 300 then
-            local success, decoded_response = json_utils.decode(response_body)
+            logger:info("API call successful, attempting to parse JSON response...")
 
-            if success and decoded_response then
-                logger:debug("Decoded response successfully")
-
-                -- Process API output mapping
-                local output_config
-                if type(api_output) == "string" then
-                    local out_success, out_decoded = json_utils.decode(api_output)
-                    if out_success then
-                        output_config = out_decoded
-                    end
-                elseif type(api_output) == "table" then
-                    output_config = api_output
-                end
-
-                if output_config then
-                    -- First pass: extract root-level fields
-                    for _, key in ipairs(output_config) do
-                        if key.ParentResultId == nil then
-                            local field_name = key.ResultFieldName
-                            local value = decoded_response[field_name]
-
-                            if value ~= nil then
-                                local value_str
-                                if type(value) == "table" then
-                                    local enc_success, enc_result = json_utils.encode(value)
-                                    value_str = enc_success and enc_result or "{}"
-                                else
-                                    value_str = tostring(value)
-                                end
-
-                                session:setVariable(key.ResultFieldTag, value_str)
-                                logger:debug(string.format("Set variable %s = %s", key.ResultFieldTag, value_str))
-                            end
-                        end
-                    end
-
-                    -- Second pass: extract nested fields using ParentResultId
-                    for _, key in ipairs(output_config) do
-                        if key.ParentResultId ~= nil then
-                            -- Get parent data from response directly
-                            local parent_data = decoded_response[key.ParentResultId]
-
-                            if parent_data and type(parent_data) == "table" then
-                                local value = parent_data[key.ResultFieldName]
-                                if value ~= nil then
-                                    local value_str = tostring(value)
-                                    session:setVariable(key.ResultFieldTag, value_str)
-                                    logger:debug(string.format("Set nested variable %s = %s (from %s.%s)",
-                                        key.ResultFieldTag, value_str, key.ParentResultId, key.ResultFieldName))
-                                end
-                            end
-                        end
-                    end
-                end
-
-                -- Legacy: Check for recordID in response for backward compatibility
-                if decoded_response.response and decoded_response.response.recordID then
-                    local record_id = decoded_response.response.recordID
-                    session:setVariable("incident_no_reponse", record_id)
-                    logger:info("Set incident_no_reponse = " .. record_id)
-                end
-
-                -- Check for new API format (data.id for incident)
-                if decoded_response.data and decoded_response.data.id then
-                    session:setVariable("incident_id_response", decoded_response.data.id)
-                    logger:info("Set incident_id_response = " .. decoded_response.data.id)
-                end
-
-                if decoded_response.data and decoded_response.data.ticket_number then
-                    session:setVariable("ticket_number_response", decoded_response.data.ticket_number)
-                    logger:info("Set ticket_number_response = " .. decoded_response.data.ticket_number)
-                end
-
-                -- Upload attachments after successful incident creation
-                if (api_id == 11 or api_id == 12) and decoded_response.data and decoded_response.data.id then
-                    logger:info("Incident created successfully, uploading attachments...")
-                    M.upload_incident_attachments(decoded_response.data.id, api_id)
-                end
-
+            -- Check if response body is empty or whitespace
+            if not response_body or response_body:match("^%s*$") then
+                logger:warning("Response body is empty or whitespace only")
+                logger:info("Empty response treated as success for API ID " .. tostring(api_id))
                 input_keys = "S"
             else
-                logger:warning("Failed to decode JSON response")
+                logger:info("About to decode JSON, body length: " .. tostring(#response_body))
+                logger:info("First character of body: '" .. response_body:sub(1, 1) .. "' (hex: " ..
+                                string.format("%02X", string.byte(response_body, 1)) .. ")")
+                logger:info("Last character of body: '" .. response_body:sub(-1) .. "' (hex: " ..
+                                string.format("%02X", string.byte(response_body, -1)) .. ")")
+
+                -- json_utils.decode returns (success, result), so we call it directly
+                local success, decoded = json_utils.decode(response_body)
+
+                if success and decoded then
+                    logger:info("JSON decode successful")
+                    logger:info("Decoded response type: " .. type(decoded))
+                    -- Legacy: Check for recordID in response for backward compatibility
+                    if decoded.response and decoded.response.recordID then
+                        local record_id = decoded.response.recordID
+                        session:setVariable("incident_no_reponse", record_id)
+                        logger:info("Set incident_no_reponse = " .. record_id)
+                    end
+                    -- Upload attachments after successful incident creation
+                    if (api_id == 11 or api_id == 12) and decoded.data and decoded.data.id then
+                        logger:info("Incident created successfully, uploading attachments...")
+                        M.upload_incident_attachments(decoded.data.id, api_id)
+                        if decoded.response and decoded.response.recordID then
+                            local record_id = decoded.response.recordID
+                            session:setVariable("incident_no_reponse", record_id)
+                            logger:info("Set incident_no_reponse = " .. record_id)
+                        end
+                    end
+                    -- Check if decoded is a table before accessing properties
+                    if type(decoded) == "table" then
+                        local keys = {}
+                        for k, v in pairs(decoded) do
+                            table.insert(keys, k)
+                        end
+                        logger:info("Response keys: " .. table.concat(keys, ", "))
+
+                        -- Check for recordID in response
+                        if decoded.response and decoded.response.recordID then
+                            local record_id = decoded.response.recordID
+                            session:setVariable("incident_no_reponse", record_id)
+                            logger:info("Set incident_no_reponse = " .. record_id)
+                        end
+
+                        -- Check for complaint ID in response
+                        if decoded.data then
+                            if decoded.data.complaint_number then
+                                session:setVariable("complaint_number_response", decoded.data.complaint_number)
+                                session:setVariable("incident_no_reponse", decoded.data.complaint_number or decoded.data.record_id)
+                                logger:info("[COMPLAINT_CREATE] Set complaint_number_response = " ..
+                                                tostring(decoded.data.complaint_number))
+                            end
+
+                            -- Check for incident number in response (for APIs 11, 12)
+                            if (api_id == 11 or api_id == 12) then
+                                -- Try multiple possible field names for incident number
+                                local incident_number = decoded.data.incident_number or
+                                                       decoded.data.record_number or
+                                                       decoded.data.recordNumber or
+                                                       decoded.data.number or
+                                                       decoded.data.id
+
+                                if incident_number then
+                                    session:setVariable("incident_no_reponse", tostring(incident_number))
+                                    logger:info("[INCIDENT_CREATE] Set incident_no_reponse = " .. tostring(incident_number))
+                                else
+                                    logger:warning("[INCIDENT_CREATE] No incident number found in response data")
+                                    -- Log all available fields for debugging
+                                    local data_keys = {}
+                                    for k, v in pairs(decoded.data) do
+                                        table.insert(data_keys, k .. "=" .. tostring(v))
+                                    end
+                                    logger:info("[INCIDENT_CREATE] Available data fields: " .. table.concat(data_keys, ", "))
+                                end
+                            end
+                        end
+
+                        -- Check for success field
+                        if decoded.success ~= nil then
+                            logger:info("Response success field: " .. tostring(decoded.success))
+                            session:setVariable("success_response", tostring(decoded.success))
+                        end
+
+                        -- Check for message field
+                        if decoded.message then
+                            logger:info("Response message: " .. tostring(decoded.message))
+                            session:setVariable("message_response", tostring(decoded.message))
+                        end
+
+                        -- Check for token field (authentication)
+                        if decoded.data and decoded.data.token then
+                            logger:info("[AUTHENTICATION] Token received, length: " .. tostring(#decoded.data.token))
+                            session:setVariable("Access_token", decoded.data.token)
+                            logger:info("[AUTHENTICATION] Set Access_token variable")
+                        end
+
+                        -- Check for attachment upload response (APIs 23, 24, 25)
+                        if api_id == 23 or api_id == 24 or api_id == 25 then
+                            local attachment_type = "UNKNOWN"
+                            if api_id == 23 then
+                                attachment_type = "INCIDENT"
+                            elseif api_id == 24 or api_id == 25 then
+                                attachment_type = "COMPLAINT"
+                            end
+
+                            logger:info(string.format("[%s_ATTACHMENT] === ATTACHMENT UPLOAD RESPONSE ===",
+                                attachment_type))
+                            logger:info(string.format("[%s_ATTACHMENT] API ID: %d", attachment_type, api_id))
+
+                            if decoded.success then
+                                logger:info(string.format("[%s_ATTACHMENT] Upload status: SUCCESS", attachment_type))
+                            else
+                                logger:warning(string.format("[%s_ATTACHMENT] Upload status: FAILED", attachment_type))
+                            end
+
+                            if decoded.message then
+                                logger:info(string.format("[%s_ATTACHMENT] Message: %s", attachment_type,
+                                    decoded.message))
+                            end
+
+                            if decoded.data then
+                                if decoded.data.id then
+                                    logger:info(string.format("[%s_ATTACHMENT] Attachment ID: %s", attachment_type,
+                                        decoded.data.id))
+                                    session:setVariable("attachment_id_response", decoded.data.id)
+                                end
+
+                                if decoded.data.file_name then
+                                    logger:info(string.format("[%s_ATTACHMENT] File name: %s", attachment_type,
+                                        decoded.data.file_name))
+                                end
+
+                                if decoded.data.file_size then
+                                    logger:info(string.format("[%s_ATTACHMENT] File size: %s bytes", attachment_type,
+                                        tostring(decoded.data.file_size)))
+                                end
+
+                                if decoded.data.file_type then
+                                    logger:info(string.format("[%s_ATTACHMENT] File type: %s", attachment_type,
+                                        decoded.data.file_type))
+                                end
+
+                                if decoded.data.file_url or decoded.data.url then
+                                    local url = decoded.data.file_url or decoded.data.url
+                                    logger:info(string.format("[%s_ATTACHMENT] File URL: %s", attachment_type, url))
+                                end
+                            end
+
+                            if decoded.error or decoded.errors then
+                                local error_msg = decoded.error or
+                                                      (type(decoded.errors) == "table" and
+                                                          table.concat(decoded.errors, ", ") or tostring(decoded.errors))
+                                logger:error(string.format("[%s_ATTACHMENT] Error details: %s", attachment_type,
+                                    error_msg))
+                            end
+
+                            logger:info(
+                                string.format("[%s_ATTACHMENT] === END ATTACHMENT RESPONSE ===", attachment_type))
+                        end
+                    elseif type(decoded) == "boolean" then
+                        logger:warning("Response decoded as boolean value: " .. tostring(decoded))
+                        logger:warning("This might indicate an issue with the response body")
+                    else
+                        logger:warning("Unexpected decoded type: " .. type(decoded))
+                    end
+
+                    input_keys = "S"
+                else
+                    logger:error("[ERROR] JSON decode failed for API ID " .. tostring(api_id))
+                    logger:error("[ERROR] JSON decode error: " .. tostring(decoded))
+                    logger:error("[ERROR] Response body that failed to parse: " .. tostring(response_body))
+                    logger:error("[ERROR] Response body hex dump (first 100 bytes):")
+                    local hex_dump = ""
+                    for i = 1, math.min(100, #response_body) do
+                        hex_dump = hex_dump .. string.format("%02X ", string.byte(response_body, i))
+                    end
+                    logger:error(hex_dump)
+                    input_keys = "F"
+                end
             end
         else
-            logger:error("API call failed with HTTP code: " .. tostring(response_code))
+            logger:error("[ERROR] API call failed with HTTP status: " .. tostring(response_code))
+            logger:error("[ERROR] Failed response body: " .. tostring(response_body))
+            input_keys = "F"
         end
 
     else
-        -- Handle non-JSON content types (OAuth, etc.)
-        local url = final_api:match("^(https://%S+)")
-        local headers_list = {}
+        -- Handle non-JSON content types (multipart/form-data, OAuth, etc.)
+        logger:info("Executing curl command for " .. content_type .. "...")
+        local api_response = execute_command(final_api)
 
-        for h in final_api:gmatch('%-H%s+"[^"]+"') do
-            table.insert(headers_list, h)
+        logger:info("=== RAW API RESPONSE ===")
+        logger:info("Response length: " .. tostring(#api_response))
+        logger:info("Raw response (first 500 chars): " .. tostring(api_response:sub(1, 500)))
+
+        -- Parse response code using the +%{http_code} format
+        local response_code = tonumber(api_response:match("%+(%d+)$"))
+        local response_body = api_response:gsub("%+%d+$", "")
+
+        logger:info("=== PARSED API RESPONSE ===")
+        logger:info("HTTP status code: " .. tostring(response_code))
+        logger:info("Response body length: " .. tostring(#response_body))
+        logger:info("Response body (first 500 chars): " .. tostring(response_body:sub(1, 500)))
+
+        -- Log specific info for attachment APIs
+        if api_id == 24 or api_id == 25 then
+            logger:info("[COMPLAINT_ATTACHMENT] API ID " .. tostring(api_id) .. " - HTTP " .. tostring(response_code))
+        elseif api_id == 23 then
+            logger:info("[INCIDENT_ATTACHMENT] API ID " .. tostring(api_id) .. " - HTTP " .. tostring(response_code))
         end
 
-        local data = final_api:match('%-d%s*[\'"]([^\'"]+)[\'"]')
+        if response_code and response_code >= 200 and response_code < 300 then
+            logger:info("API call successful, attempting to parse JSON response...")
 
-        local curl_cmd = 'curl -s -k -X POST '
-        if data then
-            curl_cmd = curl_cmd .. '-d "' .. data .. '" '
-        end
-        for _, h in ipairs(headers_list) do
-            curl_cmd = curl_cmd .. h .. ' '
-        end
-        curl_cmd = curl_cmd .. (url or service_url)
+            -- Check if response body is empty or whitespace
+            if not response_body or response_body:match("^%s*$") then
+                logger:warning("Response body is empty or whitespace only")
+                logger:info("Empty response treated as success for API ID " .. tostring(api_id))
+                input_keys = "S"
+            else
+                logger:info("About to decode JSON, body length: " .. tostring(#response_body))
+                logger:info("First character of body: '" .. response_body:sub(1, 1) .. "' (hex: " ..
+                                string.format("%02X", string.byte(response_body, 1)) .. ")")
+                logger:info("Last character of body: '" .. response_body:sub(-1) .. "' (hex: " ..
+                                string.format("%02X", string.byte(response_body, -1)) .. ")")
 
-        logger:debug("Formatted curl: " .. curl_cmd)
+                -- json_utils.decode returns (success, result), so we call it directly
+                local success, decoded = json_utils.decode(response_body)
 
-        local response = execute_command(curl_cmd)
-        logger:debug("Response: " .. tostring(response))
+                if success and decoded then
+                    logger:info("JSON decode successful")
+                    logger:info("Decoded response type: " .. type(decoded))
 
-        -- Parse response
-        local body, status_code = response:match("^(.*)\n(%d%d%d)$")
+                    -- Check if decoded is a table before accessing properties
+                    if type(decoded) == "table" then
+                        local keys = {}
+                        for k, v in pairs(decoded) do
+                            table.insert(keys, k)
+                        end
+                        logger:info("Response keys: " .. table.concat(keys, ", "))
 
-        if not body then
-            body = response
-            status_code = 200
-        end
+                        -- Check for success field
+                        if decoded.success ~= nil then
+                            logger:info("Response success field: " .. tostring(decoded.success))
+                            session:setVariable("success_response", tostring(decoded.success))
+                        end
 
-        if body then
-            body = body:gsub("^%s+", ""):gsub("%s+$", "")
-        end
-        status_code = tonumber(status_code)
+                        -- Check for message field
+                        if decoded.message then
+                            logger:info("Response message: " .. tostring(decoded.message))
+                            session:setVariable("message_response", tostring(decoded.message))
+                        end
 
-        if status_code and status_code >= 200 and status_code < 300 then
-            -- Process API output mapping
-            if api_output and #api_output > 2 then
-                local output_config = json_utils.decode(api_output)
-                local decoded_response = json_utils.decode(body)
-
-                if decoded_response and output_config then
-                    for _, key in ipairs(output_config) do
-                        if key.ParentResultId == nil then
-                            local field_name = key.ResultFieldName
-
-                            -- Handle token field name mapping
-                            if field_name == "token" then
-                                field_name = "access_token"
+                        -- Check for attachment upload response (APIs 23, 24, 25)
+                        if api_id == 23 or api_id == 24 or api_id == 25 then
+                            local attachment_type = "UNKNOWN"
+                            if api_id == 23 then
+                                attachment_type = "INCIDENT"
+                            elseif api_id == 24 or api_id == 25 then
+                                attachment_type = "COMPLAINT"
                             end
 
-                            local value = decoded_response[field_name]
-                            if value then
-                                session:setVariable(key.ResultFieldTag, json_utils.encode(value))
-                                logger:debug(string.format("Set variable %s = %s", key.ResultFieldTag,
-                                    json_utils.encode(value)))
+                            logger:info(string.format("[%s_ATTACHMENT] === ATTACHMENT UPLOAD RESPONSE ===",
+                                attachment_type))
+                            logger:info(string.format("[%s_ATTACHMENT] API ID: %d", attachment_type, api_id))
+
+                            if decoded.success then
+                                logger:info(string.format("[%s_ATTACHMENT] Upload status: SUCCESS", attachment_type))
+                            else
+                                logger:warning(string.format("[%s_ATTACHMENT] Upload status: FAILED", attachment_type))
+                            end
+
+                            if decoded.message then
+                                logger:info(string.format("[%s_ATTACHMENT] Message: %s", attachment_type,
+                                    decoded.message))
+                            end
+
+                            if decoded.data then
+                                if decoded.data.id then
+                                    logger:info(string.format("[%s_ATTACHMENT] Attachment ID: %s", attachment_type,
+                                        decoded.data.id))
+                                    session:setVariable("attachment_id_response", decoded.data.id)
+                                end
+
+                                if decoded.data.file_name then
+                                    logger:info(string.format("[%s_ATTACHMENT] File name: %s", attachment_type,
+                                        decoded.data.file_name))
+                                end
+
+                                if decoded.data.file_size then
+                                    logger:info(string.format("[%s_ATTACHMENT] File size: %s bytes", attachment_type,
+                                        tostring(decoded.data.file_size)))
+                                end
+
+                                if decoded.data.file_type then
+                                    logger:info(string.format("[%s_ATTACHMENT] File type: %s", attachment_type,
+                                        decoded.data.file_type))
+                                end
+
+                                if decoded.data.file_url or decoded.data.url then
+                                    local url = decoded.data.file_url or decoded.data.url
+                                    logger:info(string.format("[%s_ATTACHMENT] File URL: %s", attachment_type, url))
+                                end
+                            end
+
+                            if decoded.error or decoded.errors then
+                                local error_msg = decoded.error or
+                                                      (type(decoded.errors) == "table" and
+                                                          table.concat(decoded.errors, ", ") or tostring(decoded.errors))
+                                logger:error(string.format("[%s_ATTACHMENT] Error details: %s", attachment_type,
+                                    error_msg))
+                            end
+
+                            logger:info(
+                                string.format("[%s_ATTACHMENT] === END ATTACHMENT RESPONSE ===", attachment_type))
+                        end
+
+                        -- Process API output mapping
+                        if api_output and #api_output > 2 then
+                            local success1, output_config = json_utils.decode(api_output)
+
+                            if success1 and output_config then
+                                for _, key in ipairs(output_config) do
+                                    if key.ParentResultId == nil then
+                                        local field_name = key.ResultFieldName
+
+                                        -- Handle token field name mapping
+                                        if field_name == "token" then
+                                            field_name = "access_token"
+                                        end
+
+                                        local value = decoded[field_name]
+                                        if value then
+                                            local success, encoded_value = json_utils.encode(value)
+                                            local value_str = success and encoded_value or tostring(value)
+                                            session:setVariable(key.ResultFieldTag, value_str)
+                                            logger:debug(string.format("Set variable %s = %s", key.ResultFieldTag,
+                                                value_str))
+                                        end
+                                    end
+                                end
+
+                                -- Process parent-child relationships
+                                for _, key in ipairs(output_config) do
+                                    if key.ParentResultId ~= nil then
+                                        local success, parent_result =
+                                            json_utils.decode(session:getVariable(key.ParentResultId))
+                                        if success and parent_result then
+                                            session:setVariable(key.ResultFieldTag, parent_result[key.ResultFieldName])
+                                        end
+                                    end
+                                end
                             end
                         end
-                    end
 
-                    -- Process parent-child relationships
-                    for _, key in ipairs(output_config) do
-                        if key.ParentResultId ~= nil then
-                            local parent_result = json_utils.decode(session:getVariable(key.ParentResultId))
-                            if parent_result then
-                                session:setVariable(key.ResultFieldTag, parent_result[key.ResultFieldName])
-                            end
-                        end
+                        input_keys = "S"
+                    elseif type(decoded) == "boolean" then
+                        logger:warning("Response decoded as boolean value: " .. tostring(decoded))
+                        logger:warning("This might indicate an issue with the response body")
+                    else
+                        logger:warning("Unexpected decoded type: " .. type(decoded))
                     end
+                else
+                    logger:error("[ERROR] JSON decode failed for API ID " .. tostring(api_id))
+                    logger:error("[ERROR] JSON decode error: " .. tostring(decoded))
+                    logger:error("[ERROR] Response body that failed to parse: " .. tostring(response_body))
+                    input_keys = "F"
                 end
             end
-
-            input_keys = "S"
+        else
+            logger:error("[ERROR] API call failed with HTTP status: " .. tostring(response_code))
+            logger:error("[ERROR] Failed response body: " .. tostring(response_body))
+            input_keys = "F"
         end
     end
 
@@ -1003,7 +1424,8 @@ end
 -- @return void
 --------------------------------------------------------------------------------
 function M.api_post(node_data)
-    logger:info(string.format("Operation 112: API POST for node %d", node_data.NodeId))
+    logger:info("=== OPERATION 112: API POST ===")
+    logger:info(string.format("Node ID: %d, Node Name: %s", node_data.NodeId, node_data.NodeName or "Unknown"))
 
     local session = session_manager.get_freeswitch_session()
 
@@ -1013,6 +1435,26 @@ function M.api_post(node_data)
     end
 
     local api_id = node_data.APIId
+    logger:info("API ID: " .. tostring(api_id))
+
+    -- Log specific info for complaint/incident APIs
+    if api_id == 10 then
+        logger:info("[AUTHENTICATION] Auth API call")
+    elseif api_id == 13 then
+        logger:info("[COMPLAINT_CREATE] Create Complaint API - AR")
+    elseif api_id == 16 then
+        logger:info("[COMPLAINT_CREATE] Create Complaint API - EN")
+    elseif api_id == 24 then
+        logger:info("[COMPLAINT_ATTACHMENT] Upload Complaint Attachment - AR")
+    elseif api_id == 25 then
+        logger:info("[COMPLAINT_ATTACHMENT] Upload Complaint Attachment - EN")
+    elseif api_id == 11 then
+        logger:info("[INCIDENT_CREATE] Create Incident API - AR")
+    elseif api_id == 12 then
+        logger:info("[INCIDENT_CREATE] Create Incident API - EN")
+    elseif api_id == 23 then
+        logger:info("[INCIDENT_ATTACHMENT] Upload Incident Attachment")
+    end
 
     -- Get API configuration
     local web_api_data = config.get_webapi_endpoints()
@@ -1023,14 +1465,24 @@ function M.api_post(node_data)
         return
     end
 
-    local method_type, content_type, service_url, api_input_data
+    local method_type, content_type, service_url, api_input_data, api_type
 
     for _, api in pairs(web_api_data) do
         if api.apiId == api_id then
             method_type = api.methodType
             content_type = api.inputMediaType
             service_url = api.serviceURL
-            api_input_data = json_utils.decode(api.apiInput)
+            api_type = api.apiType
+
+            local success, decoded_data = json_utils.decode(api.apiInput)
+            if success then
+                api_input_data = decoded_data
+            else
+                logger:error(
+                    string.format("Failed to decode apiInput for API ID %d: %s", api_id, tostring(decoded_data)))
+                api_input_data = {}
+            end
+
             break
         end
     end
@@ -1042,25 +1494,47 @@ function M.api_post(node_data)
     end
 
     -- Construct and execute API call
-    local final_api = construct_api(method_type, content_type, service_url, api_input_data)
-    logger:debug("Final API: " .. final_api)
+    local final_api = construct_api(method_type, content_type, service_url, api_input_data, api_type)
+    logger:info("=== OPERATION 112 (API POST) ===")
+    logger:info("API ID: " .. tostring(api_id))
+    logger:info("Final API command: " .. final_api)
+
+    -- Log specific info for complaint/incident APIs
+    if api_id == 13 or api_id == 16 then
+        logger:info("[COMPLAINT_CREATE] Using Operation 112 for API ID " .. tostring(api_id))
+    elseif api_id == 24 or api_id == 25 then
+        logger:info("[COMPLAINT_ATTACHMENT] Using Operation 112 for API ID " .. tostring(api_id))
+    elseif api_id == 11 or api_id == 12 then
+        logger:info("[INCIDENT_CREATE] Using Operation 112 for API ID " .. tostring(api_id))
+    elseif api_id == 23 then
+        logger:info("[INCIDENT_ATTACHMENT] Using Operation 112 for API ID " .. tostring(api_id))
+    end
 
     -- Use FreeSWITCH curl module
+    logger:info("Executing curl via FreeSWITCH session:execute...")
     session:execute("curl", final_api)
 
     local curl_response_code = tonumber(session:getVariable("curl_response_code"))
     local curl_response = session:getVariable("curl_response_data")
 
+    logger:info("=== OPERATION 112 RESPONSE ===")
     logger:info("Curl response code: " .. tostring(curl_response_code))
 
     if curl_response then
-        logger:debug("Curl response data: " .. curl_response)
+        logger:info("Curl response data length: " .. tostring(#curl_response))
+        logger:info("Curl response data (first 500 chars): " .. tostring(curl_response:sub(1, 500)))
+        logger:info("Curl response data (full): " .. curl_response)
+    else
+        logger:warning("No curl response data received")
     end
 
     local input_keys = "F"
 
     if curl_response_code and curl_response_code >= 200 and curl_response_code < 300 then
+        logger:info("API call successful (HTTP " .. tostring(curl_response_code) .. ")")
         input_keys = "S"
+    else
+        logger:error("[ERROR] API call failed with HTTP status: " .. tostring(curl_response_code))
     end
 
     call_flow.find_child_node_with_dtmf_input(input_keys, node_data)

@@ -4,6 +4,44 @@
 
 This is a completely refactored, modular IVR (Interactive Voice Response) system for FreeSWITCH. The original monolithic script (~2150 lines) has been broken down into manageable, well-documented modules organized by functionality.
 
+## 📚 Documentation
+
+This project includes comprehensive documentation to help you understand and work with the IVR system:
+
+- **[DOCUMENTATION.md](./DOCUMENTATION.md)** - Complete system documentation including:
+  - Detailed explanation of all files and directories
+  - Configuration file structure and examples
+  - Module descriptions and functions
+  - Complete guide to `ivrconfig.json` and `automax_webAPIConfig.json`
+  - Real-world examples and use cases
+
+- **[QUICK_REFERENCE.md](./QUICK_REFERENCE.md)** - Quick reference guide with:
+  - Configuration syntax cheat sheets
+  - Operation code reference table
+  - Common patterns and templates
+  - Debugging tips
+  - Session variable reference
+
+- **[CALL_FLOW_DIAGRAMS.md](./CALL_FLOW_DIAGRAMS.md)** - Visual flow diagrams showing:
+  - System architecture
+  - Complete call flow timeline
+  - Node processing patterns
+  - Error handling flows
+  - Multi-language flow examples
+
+- **[CONFIG_EXAMPLES.md](./CONFIG_EXAMPLES.md)** - Ready-to-use configuration examples:
+  - Simple welcome flows
+  - Multi-level menus
+  - Language selection
+  - Customer ID collection
+  - Recording messages
+  - API integration
+  - Incident creation
+  - Call transfers
+  - And more...
+
+**👉 Start with [DOCUMENTATION.md](./DOCUMENTATION.md) for a complete understanding of the system.**
+
 ## Architecture
 
 ### Directory Structure
